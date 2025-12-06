@@ -1,9 +1,12 @@
 import os
+import csv
+import io
 import re
 import logging
-import html
 
+import chardet
 import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -15,16 +18,15 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import TimedOut
-from telegram.constants import ParseMode
 
-# ---------------- Logging configuration ----------------
+# ---------------- 日志配置 ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# ---------------- Environment variables ----------------
+# ---------------- 环境变量 ----------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 if not GEMINI_API_KEY:
     logger.error("Missing Gemini API Key. Please set GEMINI_API_KEY environment variable.")
@@ -35,9 +37,9 @@ if not TELEGRAM_BOT_TOKEN:
     logger.error("Missing TELEGRAM_BOT_TOKEN environment variable.")
     raise Exception("Missing TELEGRAM_BOT_TOKEN environment variable.")
 
-# Cloud Run: WEBHOOK_URL must be set in env, e.g.:
+# Cloud Run 部署后，在环境变量中设置服务的基础 URL，例如：
 # https://your-service-name-xxxxx-uc.a.run.app
-# For local dev, if not set, fallback to http://localhost:8080
+# 本地开发如果没设置，就用 http://localhost:8080 作为占位，避免直接崩溃
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 if not WEBHOOK_URL:
     WEBHOOK_URL = "http://localhost:8080"
@@ -61,24 +63,63 @@ SYSTEM_PROMPT = os.getenv(
     ),
 )
 
-# ---------------- Gemini configuration ----------------
+# 配置 Gemini（仍用于简短评论等功能）
 try:
     genai.configure(api_key=GEMINI_API_KEY)
 except Exception as e:
     logger.error(f"Failed to configure Gemini API: {e}")
     raise
 
+# ---------------- 知识库读取函数（保留） ----------------
+CASES_CSV_PATH = r"D:\PhD\paper\paper_indai2025\code_indai2025\cases.csv"
 
-# ---------------- Email validation ----------------
+
+def load_and_serialize_cases() -> str:
+    """
+    原来的工业诊断知识库读取函数，按你的要求保留。
+    当前 bot 不使用结果，只是预留。
+    """
+    cases = []
+    logger.info(f"Attempting to load knowledge base from local file: {CASES_CSV_PATH}")
+
+    try:
+        if not os.path.exists(CASES_CSV_PATH):
+            logger.error(f"Local CSV file not found: {CASES_CSV_PATH}")
+            return "KB_LOAD_FAILED"
+
+        with open(CASES_CSV_PATH, 'rb') as f:
+            raw = f.read()
+            detected = chardet.detect(raw)
+            encoding = detected['encoding'] or 'utf-8'
+        logger.info(f"Detected encoding: {encoding}")
+
+        csvfile = io.StringIO(raw.decode(encoding))
+        reader = csv.DictReader(csvfile)
+
+        if not reader.fieldnames:
+            logger.warning("CSV DictReader could not detect any field names. CSV might be empty or malformed.")
+            return "KB_PROCESS_FAILED"
+
+        for i, row in enumerate(reader):
+            cases.append(str(row))
+
+        logger.info(f"Loaded {len(cases)} rows from CSV (for potential future use).")
+        return "\n".join(cases)
+    except Exception as e:
+        logger.error(f"Error reading local CSV: {e}", exc_info=True)
+        return "KB_PROCESS_FAILED"
+
+
+# ---------------- Email 校验 ----------------
 def is_valid_email(email: str) -> bool:
     """
-    Simple email format validation: no spaces, must contain @ and a dot.
+    简单邮箱格式校验：不能包含空格，必须有 @ 和 点号。
     """
     pattern = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
     return re.match(pattern, email) is not None
 
 
-# ---------------- Gemini short answer ----------------
+# ---------------- Gemini 调用 ----------------
 ERROR_MSG_GEMINI_FAILED = "Ошибка: Не удалось автоматически сформировать проект договора. Попробуйте позже."
 ERROR_MSG_AI_ANSWER_FAILED = (
     "К сожалению, не удалось получить автоматический ответ от AI. "
@@ -88,92 +129,91 @@ ERROR_MSG_AI_ANSWER_FAILED = (
 
 def _build_typical_contract_template(contract_type: str, subject_clause: str) -> str:
     """
-    Build a typical IT contract template in Telegram HTML format.
-    contract_type: used in the title "ДОГОВОР ...".
-    subject_clause: used in section «ПРЕДМЕТ ДОГОВОРА».
+    固定的 типовая форма договора 模板。
+    contract_type  用于标题里的“ДОГОВОР ...”,
+    subject_clause 用于 раздел «Предмет договора».
     """
     return f"""
-<b>ДОГОВОР {contract_type}</b><br>
-№ ______<br><br>
+ДОГОВОР {contract_type}
+№ ______
 
-г. __________________      «___» __________ 20___ г.<br><br>
+г. __________________      «___» __________ 20___ г.
 
-__________________________, именуемое в дальнейшем «Заказчик», в лице ___________________________,<br>
-действующего на основании ___________________, с одной стороны, и<br><br>
+__________________________, именуемое в дальнейшем «Заказчик», в лице ___________________________,
+действующего на основании ___________________, с одной стороны, и
 
-__________________________, именуемое в дальнейшем «Исполнитель», в лице ________________________,<br>
-действующего на основании ___________________, с другой стороны,<br><br>
+__________________________, именуемое в дальнейшем «Исполнитель», в лице ________________________,
+действующего на основании ___________________, с другой стороны,
 
-вместе именуемые «Стороны», заключили настоящий Договор о нижеследующем.<br><br>
+вместе именуемые «Стороны», заключили настоящий Договор о нижеследующем.
 
-<b>1. ПРЕДМЕТ ДОГОВОРА</b><br><br>
+1. ПРЕДМЕТ ДОГОВОРА
 
-1.1. {subject_clause}<br><br>
+1.1. {subject_clause}
 
-1.2. Подробное описание предмета Договора, спецификация оборудования / программного обеспечения /<br>
-услуг, а также иные технические параметры указываются в Приложении № 1 к Договору,<br>
-являющемся его неотъемлемой частью.<br><br>
+1.2. Подробное описание предмета Договора, спецификация оборудования / программного обеспечения /
+услуг, а также иные технические параметры указываются в Приложении № 1 к Договору,
+являющемся его неотъемлемой частью.
 
-<b>2. ПРАВА И ОБЯЗАННОСТИ СТОРОН</b><br><br>
+2. ПРАВА И ОБЯЗАННОСТИ СТОРОН
 
-2.1. Заказчик обязуется:<br>
-2.1.1. Предоставить Исполнителю всю необходимую информацию и документы, связанные с исполнением Договора.<br>
-2.1.2. Принять результат работ (товар, услуги) в порядке и сроки, установленные Договором.<br>
-2.1.3. Своевременно оплатить Исполнителю стоимость по Договору.<br><br>
+2.1. Заказчик обязуется:
+2.1.1. Предоставить Исполнителю всю необходимую информацию и документы, связанные с исполнением Договора.
+2.1.2. Принять результат работ (товар, услуги) в порядке и сроки, установленные Договором.
+2.1.3. Своевременно оплатить Исполнителю стоимость по Договору.
 
-2.2. Заказчик вправе:<br>
-2.2.1. Требовать от Исполнителя надлежащего исполнения обязательств и устранения недостатков.<br>
-2.2.2. Получать информацию о ходе исполнения Договора.<br><br>
+2.2. Заказчик вправе:
+2.2.1. Требовать от Исполнителя надлежащего исполнения обязательств и устранения недостатков。
+2.2.2. Получать информацию о ходе исполнения Договора.
 
-2.3. Исполнитель обязуется:<br>
-2.3.1. Надлежащим образом исполнить обязательства по Договору.<br>
-2.3.2. Поставить оборудование / передать права / оказать услуги в объеме и в сроки,<br>
-установленные Договором и Приложениями к нему.<br>
-2.3.3. Уведомлять Заказчика об обстоятельствах, препятствующих исполнению обязательств.<br><br>
+2.3. Исполнитель обязуется:
+2.3.1. Надлежащим образом исполнить обязательства по Договору.
+2.3.2. Поставить оборудование / передать права / оказать услуги в объеме и в сроки,
+установленные Договором и Приложениями к нему.
+2.3.3. Уведомлять Заказчика о обстоятельствах, препятствующих исполнению обязательств.
 
-2.4. Исполнитель вправе:<br>
-2.4.1. Получить оплату в порядке и сроки, установленные Договором.<br>
-2.4.2. Запрашивать у Заказчика информацию и документы, необходимые для исполнения обязательств.<br><br>
+2.4. Исполнитель вправе:
+2.4.1. Получить оплату в порядке и сроки, установленные Договором.
+2.4.2. Запрашивать у Заказчика информацию и документы, необходимые для исполнения обязательств.
 
-<b>3. СРОК ДЕЙСТВИЯ ДОГОВОРА</b><br><br>
+3. СРОК ДЕЙСТВИЯ ДОГОВОРА
 
-3.1. Договор вступает в силу с момента его подписания Сторонами и действует до «___» __________ 20___ г.<br>
-3.2. В части расчетов и ответственности Сторон Договор действует до полного исполнения обязательств.<br><br>
+3.1. Договор вступает в силу с момента его подписания Сторонами и действует до «___» __________ 20___ г.
+3.2. В части расчетов и ответственности Сторон Договор действует до полного исполнения обязательств.
 
-<b>4. ПОРЯДОК РАСЧЕТОВ</b><br><br>
+4. ПОРЯДОК РАСЧЕТОВ
 
-4.1. Общая цена Договора составляет ________ (__________________________) рублей, в том числе НДС (при наличии) ________ рублей.<br>
-4.2. Расчеты осуществляются в безналичной форме путем перечисления денежных средств<br>
-на расчетный счет Исполнителя на основании счетов и/или актов выполненных работ / накладных.<br>
-4.3. Конкретный порядок и сроки оплаты (аванс, поэтапная оплата и пр.) указываются в Приложении № 2.<br><br>
+4.1. Общая цена Договора составляет ________ (__________________________) рублей, в том числе НДС (при наличии) ________ рублей.
+4.2. Расчеты осуществляются в безналичной форме путем перечисления денежных средств
+на расчетный счет Исполнителя на основании счетов и/или актов выполненных работ / накладных.
+4.3. Конкретный порядок и сроки оплаты (аванс, поэтапная оплата и пр.) указываются в Приложении № 2.
 
-<b>5. ОТВЕТСТВЕННОСТЬ СТОРОН</b><br><br>
+5. ОТВЕТСТВЕННОСТЬ СТОРОН
 
-5.1. За неисполнение или ненадлежащее исполнение обязательств по Договору Стороны несут ответственность<br>
-в соответствии с действующим законодательством Российской Федерации и условиями Договора.<br>
-5.2. Неустойка (штраф, пени) за нарушение сроков исполнения обязательств указывается в разделе 5.3. и, при необходимости, в Приложении № 3.<br>
-5.3. Стороны освобождаются от ответственности за частичное или полное неисполнение обязательств,<br>
-если оно явилось следствием обстоятельств непреодолимой силы (форс-мажор), подтвержденных в установленном порядке.<br><br>
+5.1. За неисполнение или ненадлежащее исполнение обязательств по Договору Стороны несут ответственность
+в соответствии с действующим законодательством Российской Федерации и условиями Договора.
+5.2. Неустойка (штраф, пени) за нарушение сроков исполнения обязательств указывается в разделе 5.3. и, при необходимости, в Приложении № 3.
+5.3. Стороны освобождаются от ответственности за частичное или полное неисполнение обязательств,
+если оно явилось следствием обстоятельств непреодолимой силы (форс-мажор), подтвержденных в установленном порядке.
 
-<b>6. ПОРЯДОК ИЗМЕНЕНИЯ И РАСТОРЖЕНИЯ ДОГОВОРА</b><br><br>
+6. ПОРЯДОК ИЗМЕНЕНИЯ И РАСТОРЖЕНИЯ ДОГОВОРА
 
-6.1. Все изменения и дополнения к настоящему Договору действительны при условии,<br>
-что они совершены в письменной форме и подписаны уполномоченными представителями Сторон.<br>
-6.2. Договор может быть расторгнут по соглашению Сторон, а также в иных случаях, предусмотренных законодательством РФ и настоящим Договором.<br>
-6.3. Сторона, инициирующая расторжение Договора, направляет другой Стороне письменное уведомление не позднее чем за ______ календарных дней.<br><br>
+6.1. Все изменения и дополнения к настоящему Договору действительны при условии,
+что они совершены в письменной форме и подписаны уполномоченными представителями Сторон.
+6.2. Договор может быть расторгнут по соглашению Сторон, а также в иных случаях, предусмотренных законодательством РФ и настоящим Договором.
+6.3. Сторона, инициирующая расторжение Договора, направляет другой Стороне письменное уведомление не позднее чем за ______ календарных дней.
 
-<b>7. ПРОЧИЕ УСЛОВИЯ</b><br><br>
+7. ПРОЧИЕ УСЛОВИЯ
 
-7.1. Во всем остальном, что не урегулировано настоящим Договором, Стороны руководствуются действующим законодательством Российской Федерации.<br>
-7.2. Переписка и документы, направленные Сторонами по официальным адресам, считаются надлежащим образом полученными.<br>
-7.3. Приложения к Договору являются его неотъемлемой частью:<br>
-Приложение № 1 – Спецификация / техническое задание;<br>
-Приложение № 2 – Порядок расчетов;<br>
-Приложение № 3 – Иные условия (при необходимости).<br><br>
+7.1. Во всем остальном, что не урегулировано настоящим Договором, Стороны руководствуются действующим законодательством Российской Федерации.
+7.2. Переписка и документы, направленные Сторонами по официальным адресам, считаются надлежащим образом полученными.
+7.3. Приложения к Договору являются его неотъемлемой частью:
+Приложение № 1 – Спецификация / техническое задание;
+Приложение № 2 – Порядок расчетов;
+Приложение № 3 – Иные условия (при необходимости).
 
-<b>8. РЕКВИЗИТЫ И ПОДПИСИ СТОРОН</b><br><br>
+8. РЕКВИЗИТЫ И ПОДПИСИ СТОРОН
 
-<pre>
 ЗАКАЗЧИК:
 Полное наименование: __________________________________________
 Юридический адрес: ___________________________________________
@@ -197,15 +237,13 @@ __________________________, именуемое в дальнейшем «Исп�
 Корр./счет: ___________________________________________________
 Телефон / e-mail: _____________________________________________
 Подпись: ___________________    М.П.
-</pre>
-""".strip()
+"""  # 这里的下划线和空白处就是“填空”的位置
 
 
 def generate_contract_draft(contract_subject: str, extra_info: str = "") -> str:
     """
-    Return a fixed typical IT contract form based on the subject.
-    The template is in Telegram HTML format with many fields left as underscores
-    to be filled in by users/lawyers.
+    现在不再调用 Gemini，而是根据合同主题返回一份固定的 типовая форма договора，
+    文本中有大量下划线，供用户/公司自己填空。
     """
     subject_lower = contract_subject.lower()
 
@@ -245,18 +283,16 @@ def generate_contract_draft(contract_subject: str, extra_info: str = "") -> str:
             "в соответствии с условиями настоящего Договора."
         )
 
-    # If user provided extra info, append it safely to the subject clause
+    # 如果用户额外写了一些说明，可以轻微补充到 предмете
     if extra_info:
-        safe_extra = html.escape(extra_info)
-        subject_clause += f" Дополнительные существенные условия по предмету: {safe_extra}"
+        subject_clause += f" Дополнительные существенные условия по предмету: {extra_info}"
 
     return _build_typical_contract_template(contract_type, subject_clause)
 
 
 async def generate_short_answer(question: str) -> str:
     """
-    Use Gemini to generate a brief Russian comment (3–5 sentences)
-    for free-form questions / custom subjects / counterparty contracts.
+    使用 Gemini 对“自由问题 / 其他 предмет / 对方合同”给一个简短俄文回答（3–5 句）。
     """
     prompt_text = (
         SYSTEM_PROMPT
@@ -281,19 +317,13 @@ async def generate_short_answer(question: str) -> str:
         return ERROR_MSG_AI_ANSWER_FAILED
 
 
-# ---------------- Helper: split long messages ----------------
-MAX_TG_MESSAGE_LEN = 4000  # Telegram limit is 4096; keep some margin
+# ---------------- 工具：分段发送长文本 ----------------
+MAX_TG_MESSAGE_LEN = 4000  # Telegram 限制 4096，这里稍微留点余量
 
 
-async def send_long_text(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    text: str,
-    parse_mode: str | None = None,
-) -> None:
+async def send_long_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
     """
-    Send long text in chunks (up to MAX_TG_MESSAGE_LEN characters),
-    optionally using a given parse_mode (e.g. HTML).
+    把很长的文本按 4000 字一段发，避免一次性太大。
     """
     if not text:
         return
@@ -301,14 +331,11 @@ async def send_long_text(
     for start in range(0, len(text), MAX_TG_MESSAGE_LEN):
         chunk = text[start:start + MAX_TG_MESSAGE_LEN]
         logger.info(f"DEBUG: sending chunk [{start}:{start+len(chunk)}]")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=chunk,
-            parse_mode=parse_mode,
-        )
+        await context.bot.send_message(chat_id=chat_id, text=chunk)
 
 
-# ---------------- Telegram bot conversation logic ----------------
+# ---------------- Telegram 机器人逻辑 ----------------
+
 (
     CHOOSING_PATH,
     CHOOSING_SUBJECT,
@@ -333,9 +360,6 @@ TEMPLATE_NOT_OK = "Типовая форма не подходит"
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    /start command: reset conversation and ask user which path to choose.
-    """
     context.user_data.clear()
 
     keyboard = [[MAIN_OPTION_PROCUREMENT, MAIN_OPTION_QUESTION]]
@@ -355,9 +379,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def choosing_path(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Handle the first user choice: IT procurement vs free-form question.
-    """
     user_choice = (update.message.text or "").strip()
     logger.info(f"DEBUG: choosing_path, user_choice='{user_choice}'")
 
@@ -383,18 +404,16 @@ async def choosing_path(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text(text_3, reply_markup=reply_markup)
         return CHOOSING_SUBJECT
 
-    await update.message.reply_text(
-        "Напишите, пожалуйста, Ваш вопрос. Я дам краткий комментарий, "
-        "а затем ваш запрос будет передан юристам для более детального анализа.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return WAITING_FREE_QUESTION
+    else:
+        await update.message.reply_text(
+            "Напишите, пожалуйста, Ваш вопрос. Я дам краткий комментарий, "
+            "а затем ваш запрос будет передан юристам для более детального анализа.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return WAITING_FREE_QUESTION
 
 
 async def handle_free_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Process a free-form legal/IT procurement question and return a brief AI comment.
-    """
     question = (update.message.text or "").strip()
     logger.info(f"Свободный вопрос пользователя: {question}")
 
@@ -414,9 +433,6 @@ async def handle_free_question(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def choosing_subject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Handle the choice of contract subject (predefined or custom).
-    """
     choice = (update.message.text or "").strip()
     context.user_data["subject"] = choice
     logger.info(f"DEBUG: choosing_subject, choice='{choice}'")
@@ -433,11 +449,8 @@ async def choosing_subject(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def handle_subject_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Handle a custom contract subject described in free text by the user.
-    """
     subject_text = (update.message.text or "").strip()
-    logger.info(f"Custom contract subject: {subject_text}")
+    logger.info(f"Пользовательский предмет договора (другой): {subject_text}")
     context.user_data["subject_other_detail"] = subject_text
 
     await update.message.reply_text("Пожалуйста, подождите...")
@@ -459,9 +472,6 @@ async def handle_subject_other(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def send_template_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Inform the user that there is an approved typical contract form for the selected subject.
-    """
     text_6 = (
         "Поздравляем! Для выбранного предмета договора в нашей компании разработана и утверждена "
         "типовая форма договора.\n\n"
@@ -483,9 +493,6 @@ async def send_template_offer(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_template_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Process the user's decision: typical form is suitable or not.
-    """
     decision = (update.message.text or "").strip()
     logger.info(f"DEBUG: handle_template_decision, decision='{decision}'")
 
@@ -497,7 +504,7 @@ async def handle_template_decision(update: Update, context: ContextTypes.DEFAULT
             reply_markup=ReplyKeyboardRemove(),
         )
 
-        # Build fixed HTML template for the selected subject
+        # 这里已经是固定模板，不再调用 Gemini，只是根据 subject 选择对应的 типовая форма
         draft_text = generate_contract_draft(subject)
 
         full_text = (
@@ -507,13 +514,8 @@ async def handle_template_decision(update: Update, context: ContextTypes.DEFAULT
             "и передать проект юристам компании для согласования."
         )
 
-        logger.info("DEBUG: sending fixed HTML template contract to user (may be split into chunks)")
-        await send_long_text(
-            context,
-            update.effective_chat.id,
-            full_text,
-            parse_mode=ParseMode.HTML,
-        )
+        logger.info("DEBUG: sending fixed template contract to user (may be split into chunks)")
+        await send_long_text(context, update.effective_chat.id, full_text)
 
         context.user_data["email_purpose"] = "template_ok"
         await context.bot.send_message(
@@ -526,7 +528,7 @@ async def handle_template_decision(update: Update, context: ContextTypes.DEFAULT
         )
         return WAITING_EMAIL
 
-    if decision == TEMPLATE_NOT_OK:
+    elif decision == TEMPLATE_NOT_OK:
         text_72 = (
             "К сожалению, предложенная типовая форма не подходит для этой сделки.\n"
             "Контрагент предлагает свою форму договора."
@@ -540,21 +542,19 @@ async def handle_template_decision(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(text_8_prompt)
         return WAITING_NONSTANDARD_CONTRACT
 
-    await update.message.reply_text(
-        f"Пожалуйста, выберите один из вариантов: «{TEMPLATE_OK}» или «{TEMPLATE_NOT_OK}»."
-    )
-    return WAITING_TEMPLATE_DECISION
+    else:
+        await update.message.reply_text(
+            f"Пожалуйста, выберите один из вариантов: «{TEMPLATE_OK}» или «{TEMPLATE_NOT_OK}»."
+        )
+        return WAITING_TEMPLATE_DECISION
 
 
 async def handle_nonstandard_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Handle a non-standard contract form provided by the counterparty (text or file).
-    """
     msg = update.message
     text_part = (msg.caption or msg.text or "").strip()
     subject = context.user_data.get("subject", "ИТ-договор")
 
-    logger.info("Received non-standard contract form (text or file).")
+    logger.info("Получена нетиповая форма договора (текст или файл).")
     logger.info(f"DEBUG nonstandard text: '{text_part[:200]}'...")
 
     description = (
@@ -580,9 +580,6 @@ async def handle_nonstandard_contract(update: Update, context: ContextTypes.DEFA
 
 
 async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Validate and store the user's corporate email, then finish the conversation.
-    """
     email = (update.message.text or "").strip()
     logger.info(f"DEBUG: handle_email, got='{email}'")
 
@@ -632,9 +629,6 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    /cancel command: stop the conversation and reset keyboard.
-    """
     await update.message.reply_text(
         "Диалог прерван. Чтобы начать заново, используйте команду /start.",
         reply_markup=ReplyKeyboardRemove(),
@@ -643,21 +637,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Global error handler for Telegram updates.
-    """
     logger.error("Exception while handling an update:", exc_info=context.error)
     if isinstance(context.error, TimedOut):
         logger.error("DEBUG: Telegram request timed out (likely proxy/network issue).")
 
 
-# ---------------- Cloud Run / Webhook entry point ----------------
+# ---------------- Cloud Run / Webhook 入口 ----------------
 def main() -> None:
     """
-    Entry point for Cloud Run.
-    Uses webhook mode instead of local long polling.
+    Cloud Run 使用的入口函数。
+    通过 webhook 模式接收 Telegram 更新，而不是本地长轮询。
     """
-    # Cloud Run passes the port via the PORT environment variable
+    # Cloud Run 会通过 PORT 环境变量告诉要监听的端口
     port = int(os.environ.get("PORT", "8080"))
 
     application = (
@@ -703,7 +694,7 @@ def main() -> None:
     application.add_handler(conv_handler)
     application.add_error_handler(error_handler)
 
-    # Webhook URL: base service URL + /<bot token>
+    # Webhook URL：Cloud Run 服务的基础地址 + /<bot token>
     webhook_path = f"/{TELEGRAM_BOT_TOKEN}"
     webhook_url_full = WEBHOOK_URL.rstrip("/") + webhook_path
 
